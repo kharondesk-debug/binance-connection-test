@@ -11,10 +11,26 @@ import aiohttp
 
 
 class ApiFault(RuntimeError):
-    def __init__(self, status=0, delay=10, reason='API unavailable'):
+    def __init__(self, status=0, delay=10, reason='API unavailable', reason_code=None):
         super().__init__(reason)  # Never include request URLs, tokens or bodies.
         self.status = status
         self.delay = delay
+        # The diagnostic cause is bounded and must never contain a request URL,
+        # response body or credential-bearing exception string.
+        if status:
+            self.reason_code = 'HTTP_' + str(status)
+        elif reason_code in {'CLOSED', 'TIMEOUT', 'DATA', 'NETWORK', 'API'}:
+            self.reason_code = reason_code
+        elif any(word in reason.lower() for word in ('invalid', 'malformed', 'empty', 'no valid')):
+            self.reason_code = 'DATA'
+        elif any(word in reason.lower() for word in ('disconnect', 'closed', 'ended')):
+            self.reason_code = 'CLOSED'
+        elif 'timeout' in reason.lower():
+            self.reason_code = 'TIMEOUT'
+        elif 'network' in reason.lower():
+            self.reason_code = 'NETWORK'
+        else:
+            self.reason_code = 'API'
 
 
 def retry_delay(value, default=60):
@@ -58,22 +74,26 @@ async def json_request(session, method, url, *, params=None, payload=None, heade
                 delay = retry_delay(response.headers.get('Retry-After'))
                 try:
                     body = await response.json(content_type=None)
-                    if isinstance(body, dict):
-                        delay = max(delay, retry_delay((body.get('parameters') or {}).get('retry_after'), default=0))
+                    if isinstance(body, dict) and isinstance(body.get('parameters'), dict):
+                        delay = max(delay, retry_delay(body['parameters'].get('retry_after'), default=0))
                 except (ValueError, aiohttp.ClientError):
                     pass
                 raise ApiFault(response.status, delay, 'Rate limited')
             if response.status != 200:
                 raise ApiFault(response.status, 60, 'HTTP request failed')
             # Binance's actual IP consumption may include other clients on this IP.
-            used = int(response.headers.get('X-MBX-USED-WEIGHT-1M', '0'))
             try:
+                used = int(response.headers.get('X-MBX-USED-WEIGHT-1M', '0'))
                 value = await response.json(content_type=None, loads=lambda text: json.loads(text, parse_float=Decimal))
-            except (ValueError, aiohttp.ClientError):
-                raise ApiFault(0, 60, 'Malformed API JSON') from None
+            except ValueError:
+                raise ApiFault(0, 60, 'Malformed API JSON', 'DATA') from None
             return value, used
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        raise ApiFault(0, 10, 'Network request failed') from None
+    except asyncio.TimeoutError:
+        raise ApiFault(0, 10, 'Network timeout', 'TIMEOUT') from None
+    except (aiohttp.ServerDisconnectedError, ConnectionResetError, BrokenPipeError):
+        raise ApiFault(0, 10, 'Network connection closed', 'CLOSED') from None
+    except aiohttp.ClientError:
+        raise ApiFault(0, 10, 'Network request failed', 'NETWORK') from None
 
 
 class Binance:
@@ -133,13 +153,27 @@ class Telegram:
             raise ApiFault(0, delay, 'Telegram operation rejected')
         return result.get('result')
 
-    async def send(self, text):
-        await self.call('sendMessage', {'chat_id': self.chat_id, 'text': text,
-                                        'link_preview_options': {'is_disabled': True}})
+    async def send(self, text, reply_markup=None):
+        payload = {'chat_id': self.chat_id, 'text': text,
+                   'link_preview_options': {'is_disabled': True}}
+        if reply_markup is not None:
+            payload['reply_markup'] = reply_markup
+        return await self.call('sendMessage', payload)
+
+    async def edit(self, message_id, text, reply_markup=None):
+        payload = {'chat_id': self.chat_id, 'message_id': message_id, 'text': text,
+                   'link_preview_options': {'is_disabled': True}}
+        if reply_markup is not None:
+            payload['reply_markup'] = reply_markup
+        return await self.call('editMessageText', payload)
+
+    async def answer_callback(self, query_id, text='', alert=False):
+        return await self.call('answerCallbackQuery', {'callback_query_id': query_id,
+                               'text': text[:200], 'show_alert': bool(alert)})
 
     async def updates(self, offset):
         return await self.call('getUpdates', {'offset': offset, 'timeout': 30,
-                                              'allowed_updates': ['message']}, timeout=40)
+                                              'allowed_updates': ['message', 'callback_query']}, timeout=40)
 
 
 def delayed_message(row, now_ms):

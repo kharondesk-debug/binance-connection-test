@@ -3,6 +3,10 @@ import asyncio
 import json
 import time
 
+from engine import Candle, _decimal, from_dict
+from decimal import Decimal
+from policy import SEED_META_KEY, STATUSES, validate_seed
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bot_symbols (
     symbol TEXT PRIMARY KEY, state JSONB NOT NULL, updated_at BIGINT NOT NULL
@@ -14,12 +18,30 @@ CREATE TABLE IF NOT EXISTS bot_pending (
     detected_ms BIGINT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
     due_ms BIGINT NOT NULL DEFAULT 0
 );
+ALTER TABLE bot_pending ADD COLUMN IF NOT EXISTS reply_markup JSONB;
+CREATE TABLE IF NOT EXISTS bot_watch (
+    symbol TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('APPROVED','BLOCKED','REVIEW','PENDING')),
+    generation BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0),
+    listing_key TEXT NOT NULL DEFAULT '', notice_id TEXT NOT NULL DEFAULT '',
+    message_id BIGINT, updated_ms BIGINT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS bot_watch_notice ON bot_watch(notice_id);
 CREATE INDEX IF NOT EXISTS bot_pending_due ON bot_pending(due_ms, detected_ms);
 """
 
 
 class Backpressure(RuntimeError):
     pass
+
+
+class PolicyConflict(RuntimeError):
+    """A concurrent or already processed approval must never be overwritten."""
+    pass
+
+
+def _decode(value):
+    return json.loads(value) if isinstance(value, str) else value
 
 
 class Store:
@@ -52,42 +74,111 @@ class Store:
                 await self.conn.close()
                 self.conn = None
 
+    async def seed_policy(self, config):
+        """Insert the validated baseline once, preserving every subsequent choice."""
+        config = validate_seed(config)
+        stamp = int(time.time() * 1000)
+        marker = {key: config[key] for key in ('version', 'sha256', 'snapshot_ms', 'source_sha256')}
+        async with self.lock:
+            async with self.conn.transaction():
+                current = await self.conn.fetchval('SELECT value FROM bot_meta WHERE key=$1 FOR UPDATE', SEED_META_KEY)
+                if current is not None:
+                    if _decode(current) != marker:
+                        raise ValueError('Approval seed differs from the durable baseline; refusing to overwrite')
+                    rows = await self.conn.fetch('SELECT symbol,status,generation FROM bot_watch')
+                    by_symbol = {row['symbol']: row for row in rows}
+                    if (not set(config['snapshot']) <= by_symbol.keys()
+                            or any(row['status'] not in STATUSES or row['generation'] < 1 for row in rows)):
+                        raise ValueError('Incomplete or invalid durable approval policy')
+                    return False
+                if await self.conn.fetchval('SELECT count(*) FROM bot_watch'):
+                    raise ValueError('Approval rows have no trusted seed marker; manual verification required')
+                for key, status in (('approved', 'APPROVED'), ('blocked', 'BLOCKED'), ('review', 'REVIEW')):
+                    await self.conn.executemany(
+                        'INSERT INTO bot_watch(symbol,status,generation,listing_key,notice_id,updated_ms) '
+                        'VALUES($1,$2,1,\'\',\'\',$3)',
+                        [(symbol, status, stamp) for symbol in config[key]])
+                await self.conn.execute(
+                    'INSERT INTO bot_meta VALUES($1,$2::jsonb)', SEED_META_KEY, json.dumps(marker))
+        return True
+
+    async def load_policy(self):
+        async with self.lock:
+            rows = await self.conn.fetch('SELECT * FROM bot_watch')
+        return {row['symbol']: dict(row) for row in rows}
+
+    async def load_states(self, approved_symbols):
+        """Stream states, selecting candle JSON only for approved contracts in SQL.
+
+        Nonapproved A/B flags remain available for restart-safe reapproval. Their
+        historic candle rows stay in PostgreSQL and are never decoded or copied.
+        """
+        states = {}
+        revisions = {}
+        async with self.lock:
+            async with self.conn.transaction():
+                query = ('SELECT s.symbol,s.state,c.candles FROM bot_symbols s '
+                         'LEFT JOIN bot_candles c ON c.symbol=s.symbol '
+                         'AND s.symbol = ANY($1::text[])')
+                async for row in self.conn.cursor(query, list(approved_symbols), prefetch=16):
+                    data = dict(_decode(row['state']))
+                    # One JSON row at a time, not a second full-universe snapshot.
+                    data['candles'] = _decode(row['candles']) if row['candles'] else []
+                    state = from_dict(data)
+                    states[row['symbol']] = state
+                    revisions[row['symbol']] = state.history_revision
+                meta = {row['key']: _decode(row['value'])
+                        for row in await self.conn.fetch('SELECT key,value FROM bot_meta')}
+        self.history_revisions = revisions
+        return states, meta
+
+    async def load_history(self, symbol):
+        async with self.lock:
+            value = await self.conn.fetchval('SELECT candles FROM bot_candles WHERE symbol=$1', symbol)
+        return [Candle(int(item['open_ms']), int(item['close_ms']),
+                       _decimal(item['close']) or Decimal('NaN')) for item in (_decode(value) or [])]
+
     async def load(self):
+        """Legacy compatibility only; v4 startup uses selective load_states()."""
         async with self.lock:
             rows = await self.conn.fetch('SELECT s.symbol,s.state,c.candles FROM bot_symbols s LEFT JOIN bot_candles c USING(symbol)')
             meta = await self.conn.fetch('SELECT key,value FROM bot_meta')
-        decode = lambda v: json.loads(v) if isinstance(v, str) else v
-        states = {r['symbol']: {**decode(r['state']), 'candles': decode(r['candles']) if r['candles'] else []} for r in rows}
+        states = {r['symbol']: {**_decode(r['state']), 'candles': _decode(r['candles']) if r['candles'] else []} for r in rows}
         self.history_revisions = {symbol: value.get('history_revision', 0) for symbol, value in states.items()}
-        return states, {
-            r['key']: decode(r['value']) for r in meta}
+        return states, {r['key']: _decode(r['value']) for r in meta}
 
     async def count_pending(self):
         async with self.lock:
             return await self.conn.fetchval('SELECT count(*) FROM bot_pending')
 
-    async def commit(self, states=(), events=(), meta=None, delete=()):
+    async def commit(self, states=(), events=(), meta=None, delete=(), watch=()):
         """Persist event flags and pending messages in the SAME transaction."""
         stamp = int(time.time() * 1000)
+        states, events, watch = tuple(states), tuple(events), tuple(watch)
+        changed_histories = {}
         async with self.lock:
             async with self.conn.transaction():
+                for record in watch:
+                    await self._write_watch(record, stamp)
                 count = await self.conn.fetchval('SELECT count(*) FROM bot_pending')
                 if count + len(events) > self.max_pending:
                     raise Backpressure('Outbox full; new detection paused')
                 for symbol, payload in states:
                     payload = dict(payload)
-                    candles = payload.pop('candles', [])
-                    if self.history_revisions.get(symbol) != payload.get('history_revision', 0):
+                    has_candles = 'candles' in payload
+                    candles = payload.pop('candles', None)
+                    if has_candles and self.history_revisions.get(symbol) != payload.get('history_revision', 0):
                         await self.conn.execute('INSERT INTO bot_candles VALUES($1,$2::jsonb) ON CONFLICT(symbol) DO UPDATE SET candles=EXCLUDED.candles', symbol, json.dumps(candles))
+                        changed_histories[symbol] = payload.get('history_revision', 0)
                     await self.conn.execute(
                         'INSERT INTO bot_symbols VALUES($1,$2::jsonb,$3) '
                         'ON CONFLICT(symbol) DO UPDATE SET state=EXCLUDED.state, '
                         'updated_at=EXCLUDED.updated_at', symbol, json.dumps(payload), stamp)
                 for event in events:
                     await self.conn.execute(
-                        'INSERT INTO bot_pending(id,symbol,body,detected_ms) VALUES($1,$2,$3,$4) '
+                        'INSERT INTO bot_pending(id,symbol,body,detected_ms,reply_markup) VALUES($1,$2,$3,$4,$5::jsonb) '
                         'ON CONFLICT(id) DO NOTHING', event.id, event.symbol,
-                        event.message, event.detected_ms)
+                        event.message, event.detected_ms, json.dumps(getattr(event, 'reply_markup', None)))
                 for key, value in (meta or {}).items():
                     await self.conn.execute(
                         'INSERT INTO bot_meta VALUES($1,$2::jsonb) ON CONFLICT(key) '
@@ -96,8 +187,7 @@ class Store:
                     # Pending detected signals deliberately survive delisting.
                     await self.conn.execute('DELETE FROM bot_symbols WHERE symbol=$1', symbol)
                     await self.conn.execute('DELETE FROM bot_candles WHERE symbol=$1', symbol)
-            for symbol, payload in states:
-                self.history_revisions[symbol] = payload.get('history_revision', 0)
+            self.history_revisions.update(changed_histories)
             for symbol in delete:
                 self.history_revisions.pop(symbol, None)
 
@@ -106,11 +196,49 @@ class Store:
             row = await self.conn.fetchrow(
                 'SELECT * FROM bot_pending WHERE due_ms <= $1 '
                 'ORDER BY detected_ms,id LIMIT 1', now_ms)
-        return dict(row) if row else None
+        if row is None:
+            return None
+        result = dict(row)
+        if result.get('reply_markup') is not None:
+            result['reply_markup'] = _decode(result['reply_markup'])
+        return result
 
-    async def complete(self, event_id):
+    async def complete(self, event_id, message_id=None):
         async with self.lock:
-            await self.conn.execute('DELETE FROM bot_pending WHERE id=$1', event_id)
+            async with self.conn.transaction():
+                if type(message_id) is int and message_id > 0:
+                    await self.conn.execute('UPDATE bot_watch SET message_id=$2 WHERE notice_id=$1', event_id, message_id)
+                await self.conn.execute('DELETE FROM bot_pending WHERE id=$1', event_id)
+
+    async def _write_watch(self, record, stamp):
+        symbol, status = record['symbol'], record['status']
+        generation = record['generation']
+        if (status not in STATUSES or type(generation) is not int or generation < 1
+                or not isinstance(symbol, str) or not symbol.endswith('USDT')):
+            raise ValueError('Invalid watch policy row')
+        current = await self.conn.fetchrow('SELECT generation,status,notice_id,message_id FROM bot_watch WHERE symbol=$1 FOR UPDATE', symbol)
+        expected = record.get('expected_generation')
+        if current is None:
+            if expected is not None:
+                raise PolicyConflict('Approval contract no longer exists')
+            await self.conn.execute(
+                'INSERT INTO bot_watch(symbol,status,generation,listing_key,notice_id,message_id,updated_ms) '
+                'VALUES($1,$2,$3,$4,$5,$6,$7)', symbol, status, generation,
+                record.get('listing_key', ''), record.get('notice_id', ''), record.get('message_id'), record.get('updated_ms', stamp))
+            return
+        if (type(expected) is not int or current['generation'] != expected
+                or (record.get('expected_status') is not None and current['status'] != record['expected_status'])
+                or generation != expected + 1):
+            raise PolicyConflict('Approval generation has already changed')
+        message_id = record.get('message_id')
+        if message_id is None and current.get('notice_id', '') == record.get('notice_id', ''):
+            # A sender acknowledgement can reach PostgreSQL before the Bot cache.
+            # Preserve that durable reference for this request; a new notice resets it.
+            message_id = current.get('message_id')
+        await self.conn.execute(
+            'UPDATE bot_watch SET status=$2,generation=$3,listing_key=$4,notice_id=$5,message_id=$6,updated_ms=$7 WHERE symbol=$1',
+            symbol, status, generation, record.get('listing_key', ''), record.get('notice_id', ''),
+            message_id, record.get('updated_ms', stamp))
 
     async def retry(self, event_id, attempts, due_ms):
         async with self.lock:

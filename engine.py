@@ -13,23 +13,24 @@ DAY_MS = 24 * HOUR_MS
 KST = timezone(timedelta(hours=9))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Candle:
     open_ms: int
     close_ms: int
     close: Decimal
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Event:
     id: str
     symbol: str
     kind: str
     detected_ms: int
     message: str
+    reply_markup: dict | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class State:
     symbol: str
     base: str
