@@ -1,0 +1,9 @@
+*
+!app.py
+!api.py
+!engine.py
+!rules.py
+!storage.py
+!requirements.txt
+!Dockerfile
+!.dockerignore
