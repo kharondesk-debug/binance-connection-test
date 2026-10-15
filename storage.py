@@ -118,20 +118,52 @@ class Store:
                 'UPDATE bot_pending SET attempts=$2,due_ms=$3 WHERE id=$1',
                 event_id, attempts, due_ms)
 
-    async def reserve_cg_call(self, now_ms, limit=6000):
-        """Count attempted requests in32UTC days; survives restarts and billing resets."""
-        day = now_ms // 86_400_000
+    async def retire_legacy_diagnostics(self):
+        """Retire removed filters only; leave signal records and histories intact."""
+        def decode(value):
+            return json.loads(value) if isinstance(value, str) else value
+
+        def obsolete(key):
+            parts = str(key).upper().split(':')
+            # Service error details may mention removed services; only its name counts.
+            kind = parts[1] if parts[0] == 'SERVICE' and len(parts) > 1 else parts[-1]
+            kind = kind.split(' ', 1)[0]
+            return any(kind == prefix or kind.startswith(prefix + '_')
+                       for prefix in ('COINGECKO', 'CLASSIFICATION', 'FDV'))
+
+        def cleaned_body(body):
+            lines = body.splitlines()
+            kept = [line for line in lines if not obsolete(line.split(': ', 1)[0].strip())]
+            if kept == lines:
+                return body
+            # A summary's old totals include the retired types and cannot stay accurate.
+            kept = [line for line in kept if not line.startswith('새 장애 유형 ')]
+            content = [line for line in kept if line.strip() and not line.startswith((
+                '진단 요약', '종목별 상세:', '모든 상세 유형과 종목은 '))]
+            return '\n'.join(kept) if content else None
+
+        obsolete_meta = {'cg_budget', 'details', 'coin_candidates', 'coin_list_ms'}
         async with self.lock:
             async with self.conn.transaction():
-                raw = await self.conn.fetchval("SELECT value FROM bot_meta WHERE key='cg_budget'")
-                budget = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                buckets = {key: count for key, count in budget.get('buckets', {}).items()
-                           if day - 31 <= int(key) <= day}
-                used = sum(buckets.values())
-                if used >= limit:
-                    raise Backpressure('CoinGecko rolling safety budget exhausted')
-                buckets[str(day)] = buckets.get(str(day), 0) + 1
-                await self.conn.execute(
-                    "INSERT INTO bot_meta VALUES('cg_budget',$1::jsonb) ON CONFLICT(key) "
-                    'DO UPDATE SET value=EXCLUDED.value', json.dumps({'buckets': buckets}))
-                return used + 1
+                for row in await self.conn.fetch('SELECT key,value FROM bot_meta'):
+                    key = row['key']
+                    if key in obsolete_meta:
+                        await self.conn.execute('DELETE FROM bot_meta WHERE key=$1', key)
+                    elif key in ('diagnostics', 'services'):
+                        previous = decode(row['value'])
+                        if not isinstance(previous, dict):
+                            continue
+                        current = {name: value for name, value in previous.items()
+                                   if not obsolete(('SERVICE:' if key == 'services' else '') + name)}
+                        if current != previous:
+                            await self.conn.execute(
+                                'UPDATE bot_meta SET value=$2::jsonb WHERE key=$1', key, json.dumps(current))
+                # This prefix guard is mandatory: A/B bodies can contain arbitrary text.
+                for row in await self.conn.fetch("SELECT id,body FROM bot_pending WHERE id LIKE 'diag:%'"):
+                    if not row['id'].startswith('diag:'):
+                        continue
+                    current = cleaned_body(row['body'])
+                    if current is None:
+                        await self.conn.execute('DELETE FROM bot_pending WHERE id=$1', row['id'])
+                    elif current != row['body']:
+                        await self.conn.execute('UPDATE bot_pending SET body=$2 WHERE id=$1', row['id'], current)

@@ -118,40 +118,6 @@ class Binance:
             raise
 
 
-class CoinGecko:
-    def __init__(self, session, key, store, monthly_limit=6000):
-        self.session, self.key, self.store = session, key, store
-        self.monthly_limit = monthly_limit
-        self.gate = WindowBudget(20, 60)
-        self.lock = asyncio.Lock()
-        self.next_request = 0.0
-        self.metadata_retry_at = 0.0
-
-    async def get(self, path, params=None):
-        from storage import Backpressure
-        metadata = path.startswith('/coins/') and path != '/coins/markets'
-        if metadata and time.monotonic() < self.metadata_retry_at:
-            raise Backpressure('Metadata budget cooldown')
-        async with self.lock:
-            await asyncio.sleep(max(0, self.next_request - time.monotonic()))
-            await self.gate.take()
-            limit = self.monthly_limit - min(1000, self.monthly_limit // 4) if metadata else self.monthly_limit
-            try:
-                await self.store.reserve_cg_call(int(time.time() * 1000), limit)
-            except Backpressure:
-                if metadata:
-                    self.metadata_retry_at = time.monotonic() + 3600
-                raise
-            self.next_request = time.monotonic() + 3.1
-            try:
-                value, _ = await json_request(self.session, 'GET',
-                    'https://api.coingecko.com/api/v3' + path, params=params,
-                    headers={'x-cg-demo-api-key': self.key})
-                return value
-            except ApiFault as exc:
-                self.next_request = time.monotonic() + max(60, exc.delay)
-                raise
-
 
 class Telegram:
     def __init__(self, session, token, chat_id):

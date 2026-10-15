@@ -10,7 +10,6 @@ from uuid import uuid4
 HOUR_MS = 3_600_000
 FOUR_HOURS_MS = 4 * HOUR_MS
 DAY_MS = 24 * HOUR_MS
-EXCLUDED_BASES = frozenset({'BTC', 'ETH', 'XRP', 'DOGE', 'TRX', 'HYPE', 'BNB', 'SOL'})
 KST = timezone(timedelta(hours=9))
 
 
@@ -40,12 +39,6 @@ class State:
     listing_status: str = 'CONFIRMED'
     listing_evidence_ms: int = 0
     trading: bool = True
-    classification: str = 'UNKNOWN'
-    cg_id: str | None = None
-    market_cap: Decimal | None = None
-    fdv: Decimal | None = None
-    cg_checked_ms: int = 0
-    mapping_valid: bool = False
     candles: list[Candle] = field(default_factory=list)
     history_ready: bool = False
     price: Decimal | None = None
@@ -84,7 +77,7 @@ class State:
 
 
 DECIMAL_FIELDS = frozenset({
-    'market_cap', 'fdv', 'price', 'funding', 'floor', 'last_official_floor',
+    'price', 'funding', 'floor', 'last_official_floor',
     'b_floor', 'history_min',
 })
 
@@ -186,20 +179,10 @@ def problems(state: State, now_ms: int) -> dict[str, str]:
     and removes resolved keys. This function never sends messages.
     """
     result: dict[str, str] = {}
-    if not state.trading or state.base.upper() in EXCLUDED_BASES:
-        return result
-    if state.classification not in ('CRYPTO', 'UNKNOWN', 'CLASSIFICATION_UNKNOWN', ''):
+    if not state.trading:
         return result
     if state.onboard_ms <= 0:
         result['LISTING_UNKNOWN'] = '상장시각을 확인할 수 없습니다.'
-    if state.classification != 'CRYPTO':
-        result['CLASSIFICATION_UNKNOWN'] = '자산 종류를 확정하지 못해 신호 판정을 보류합니다.'
-    if not state.mapping_valid or not state.cg_id:
-        result['COINGECKO_MATCH_UNKNOWN'] = 'CoinGecko 자산 ID 매칭이 불명확합니다.'
-    if not _positive(state.market_cap) or not _positive(state.fdv):
-        result['FDV_UNKNOWN'] = '시가총액 또는 FDV가 없거나 유효한 양수가 아닙니다.'
-    elif not _fresh(state.cg_checked_ms, now_ms, 48 * HOUR_MS, inclusive=True):
-        result['FDV_STALE'] = '시가총액·FDV 마지막 확인 후 48시간을 초과했습니다.'
     if not _interval_valid(state, now_ms):
         result['INTERVAL_UNKNOWN'] = '현재 정산 주기가 미확인 또는 300초를 초과해 갱신되지 않았습니다.'
     elif state.interval_hours in (4, 8) and not _floor_valid(state, now_ms):
@@ -212,12 +195,8 @@ def problems(state: State, now_ms: int) -> dict[str, str]:
         result['PRICE_INVALID'] = '현재 선물 체결가격이 유효한 양수가 아닙니다.'
     elif not _fresh(state.price_ms, now_ms, 120_000):
         result['PRICE_STALE'] = '실제 선물가격이 120초 이상 갱신되지 않았습니다.'
-    history_expected = (state.classification == 'CRYPTO' and state.mapping_valid
-                        and bool(state.cg_id) and state.onboard_ms > 0
-                        and now_ms - state.onboard_ms >= 168 * HOUR_MS
-                        and _positive(state.market_cap) and _positive(state.fdv)
-                        and state.market_cap < state.fdv * Decimal('0.95')
-                        and _fresh(state.cg_checked_ms, now_ms, 48 * HOUR_MS, inclusive=True))
+    history_expected = (state.onboard_ms > 0
+                        and now_ms - state.onboard_ms >= 168 * HOUR_MS)
     if history_expected and minimum_close(state, now_ms) is None:
         result['PRICE_HISTORY_UNKNOWN'] = '최근 구간의 완성된 4시간봉 이력이 아직 준비되지 않았습니다.'
     return result
@@ -336,13 +315,8 @@ def evaluate(state: State, now_ms: int) -> list[Event]:
     transaction and restore/reload State if the transaction fails.
     """
     _observe_segments(state, now_ms)
-    if (not state.trading or state.base.upper() in EXCLUDED_BASES
-            or state.classification != 'CRYPTO' or not state.mapping_valid
-            or not state.cg_id or state.onboard_ms <= 0
+    if (not state.trading or state.onboard_ms <= 0
             or now_ms - state.onboard_ms < 168 * HOUR_MS
-            or not _positive(state.market_cap) or not _positive(state.fdv)
-            or state.market_cap >= state.fdv * Decimal('0.95')
-            or not _fresh(state.cg_checked_ms, now_ms, 48 * HOUR_MS, inclusive=True)
             or not _positive(state.price) or not _fresh(state.price_ms, now_ms, 120_000)
             or not _finite(state.funding) or not _fresh(state.funding_ms, now_ms, 15_000)
             or state.funding >= 0 or not _interval_valid(state, now_ms)):
