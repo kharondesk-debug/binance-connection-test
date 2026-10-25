@@ -9,4 +9,5 @@
 !.dockerignore
 !policy.py
 !incidents.py
+!daily_report.py
 !approval_policy.json
