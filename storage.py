@@ -2,6 +2,7 @@
 import asyncio
 import json
 import time
+from datetime import date
 
 from engine import Candle, _decimal, from_dict
 from decimal import Decimal
@@ -28,7 +29,31 @@ CREATE TABLE IF NOT EXISTS bot_watch (
 );
 CREATE INDEX IF NOT EXISTS bot_watch_notice ON bot_watch(notice_id);
 CREATE INDEX IF NOT EXISTS bot_pending_due ON bot_pending(due_ms, detected_ms);
+CREATE TABLE IF NOT EXISTS bot_daily_days (
+    day TEXT PRIMARY KEY, payload JSONB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bot_daily_reports (
+    id TEXT PRIMARY KEY, day TEXT NOT NULL UNIQUE, body TEXT NOT NULL,
+    detected_ms BIGINT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+    due_ms BIGINT NOT NULL DEFAULT 0, sent_ms BIGINT
+);
+CREATE INDEX IF NOT EXISTS bot_daily_reports_due
+    ON bot_daily_reports(due_ms, detected_ms) WHERE sent_ms IS NULL;
+CREATE TABLE IF NOT EXISTS bot_daily_legacy (
+    id TEXT PRIMARY KEY, body TEXT NOT NULL, detected_ms BIGINT NOT NULL,
+    migrated_ms BIGINT NOT NULL
+);
 """
+
+
+DAILY_META_KEY = 'daily_report_state'
+
+
+def _day(value):
+    """Use the canonical KST date as both durable key and report identifier."""
+    if not isinstance(value, str) or len(value) != 10 or date.fromisoformat(value).isoformat() != value:
+        raise ValueError('Invalid daily report date')
+    return value
 
 
 class Backpressure(RuntimeError):
@@ -146,6 +171,100 @@ class Store:
         states = {r['symbol']: {**_decode(r['state']), 'candles': _decode(r['candles']) if r['candles'] else []} for r in rows}
         self.history_revisions = {symbol: value.get('history_revision', 0) for symbol, value in states.items()}
         return states, {r['key']: _decode(r['value']) for r in meta}
+
+    async def load_daily(self):
+        async with self.lock:
+            value = await self.conn.fetchval(
+                'SELECT value FROM bot_meta WHERE key=$1', DAILY_META_KEY)
+        return _decode(value) if value is not None else None
+
+    async def save_daily(self, snapshot, completed=()):
+        """Commit the bounded collector state and closed KST days together."""
+        completed = tuple((_day(day), payload) for day, payload in completed)
+        async with self.lock:
+            async with self.conn.transaction():
+                for day, payload in completed:
+                    await self.conn.execute(
+                        'INSERT INTO bot_daily_days(day,payload) VALUES($1,$2::jsonb) '
+                        'ON CONFLICT(day) DO NOTHING', day, json.dumps(payload))
+                await self.conn.execute(
+                    'INSERT INTO bot_meta VALUES($1,$2::jsonb) ON CONFLICT(key) '
+                    'DO UPDATE SET value=EXCLUDED.value', DAILY_META_KEY, json.dumps(snapshot))
+
+    async def daily_payload(self, day):
+        day = _day(day)
+        async with self.lock:
+            value = await self.conn.fetchval(
+                'SELECT payload FROM bot_daily_days WHERE day=$1', day)
+        return _decode(value) if value is not None else None
+
+    async def enqueue_daily(self, day, body, detected_ms, snapshot):
+        """Register one immutable report and advance its collector cursor atomically.
+
+        This separate outbox never consumes A/B or listing-notice capacity. Sent
+        rows remain as idempotence markers, including after a process restart.
+        """
+        day = _day(day)
+        async with self.lock:
+            async with self.conn.transaction():
+                inserted = await self.conn.fetchval(
+                    'INSERT INTO bot_daily_reports(id,day,body,detected_ms) '
+                    'VALUES($1,$2,$3,$4) ON CONFLICT(day) DO NOTHING RETURNING id',
+                    'daily:' + day, day, body, int(detected_ms))
+                await self.conn.execute(
+                    'INSERT INTO bot_meta VALUES($1,$2::jsonb) ON CONFLICT(key) '
+                    'DO UPDATE SET value=EXCLUDED.value', DAILY_META_KEY, json.dumps(snapshot))
+        return inserted is not None
+
+    async def first_daily(self, now_ms):
+        async with self.lock:
+            row = await self.conn.fetchrow(
+                'SELECT id,body,detected_ms,attempts,due_ms FROM bot_daily_reports '
+                'WHERE sent_ms IS NULL AND due_ms <= $1 '
+                'ORDER BY detected_ms,id LIMIT 1', now_ms)
+        return dict(row, symbol='') if row is not None else None
+
+    async def retry_daily(self, event_id, attempts, due_ms):
+        async with self.lock:
+            await self.conn.execute(
+                'UPDATE bot_daily_reports SET attempts=$2,due_ms=$3 '
+                'WHERE id=$1 AND sent_ms IS NULL', event_id, int(attempts), int(due_ms))
+
+    async def complete_daily(self, event_id):
+        async with self.lock:
+            await self.conn.execute(
+                'UPDATE bot_daily_reports SET sent_ms=$2 '
+                'WHERE id=$1 AND sent_ms IS NULL', event_id, int(time.time() * 1000))
+
+    async def migrate_daily_diagnostics(self, now_ms):
+        """Archive pending diagnostic bodies, then retire only archived diag IDs.
+
+        No body is interpreted as an incident count. Existing signal and approval
+        rows, their order, their retries, and all price/approval state stay intact.
+        A failed archive or deletion rolls the entire migration back.
+        """
+        async with self.lock:
+            async with self.conn.transaction():
+                summary = await self.conn.fetchrow(
+                    "SELECT count(*) AS count,min(detected_ms) AS first_ms,"
+                    "max(detected_ms) AS last_ms FROM bot_pending WHERE id LIKE 'diag:%'")
+                if summary['count']:
+                    await self.conn.execute(
+                        'INSERT INTO bot_daily_legacy(id,body,detected_ms,migrated_ms) '
+                        'SELECT id,body,detected_ms,$1 FROM bot_pending '
+                        "WHERE id LIKE 'diag:%' ON CONFLICT(id) DO NOTHING", int(now_ms))
+                    await self.conn.execute(
+                        "DELETE FROM bot_pending p WHERE p.id LIKE 'diag:%' "
+                        'AND EXISTS (SELECT 1 FROM bot_daily_legacy l WHERE l.id=p.id)')
+        return dict(summary)
+
+    async def legacy_summary(self):
+        """Read archived scope after a crash between migration and ledger save."""
+        async with self.lock:
+            row = await self.conn.fetchrow(
+                'SELECT count(*) AS count,min(detected_ms) AS first_ms,'
+                'max(detected_ms) AS last_ms FROM bot_daily_legacy')
+        return dict(row)
 
     async def count_pending(self):
         async with self.lock:

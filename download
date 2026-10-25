@@ -1,0 +1,13 @@
+*
+!app.py
+!api.py
+!engine.py
+!rules.py
+!storage.py
+!requirements.txt
+!Dockerfile
+!.dockerignore
+!policy.py
+!incidents.py
+!daily_report.py
+!approval_policy.json

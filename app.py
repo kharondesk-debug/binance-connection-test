@@ -10,10 +10,10 @@ import os
 from pathlib import Path
 import random
 import time
-from uuid import uuid4
 import aiohttp
 from api import ApiFault, Binance, Telegram, delayed_message, retry_delay
 from incidents import IncidentTracker, fault_code
+from daily_report import DailyLedger, day_key, next_day, render_report
 from policy import load_seed
 from engine import State, Candle, Event, evaluate, problems, to_dict, from_dict, minimum_close, FOUR_HOURS_MS, DAY_MS
 from rules import resolve_funding
@@ -121,6 +121,11 @@ class Bot:
         self.recovery_due_ms = 0
         self.recovery_backoff = RECOVERY_MIN_SECONDS
         self.memory_logged_ms = 0
+        self.daily = DailyLedger(self.now())
+        self.daily_loaded = False
+        self.daily_dirty = False
+        self.daily_closed = []
+        self.db_fault = None
 
     def now(self):
         return int(time.time() * 1000) + self.offset_ms
@@ -145,8 +150,9 @@ class Bot:
         except Backpressure:
             self.pending_full = True
             raise
-        except Exception:
+        except Exception as exc:
             self.ready = False
+            self.daily_db_failure(exc)
             LOG.error('Database unavailable; detection and sender paused')
             raise
         for state in dirty:
@@ -192,6 +198,23 @@ class Bot:
                     self.drop_cache(s)
             self.rows = self.meta.get('exchange_rows', {})
             self.services = copy.deepcopy(self.meta.get('services', {}))
+            await self.store.migrate_daily_diagnostics(self.now())
+            if not self.daily_loaded:
+                snapshot = await self.store.load_daily()
+                self.daily = DailyLedger(self.now(), snapshot=snapshot, restarted=snapshot is not None)
+                self.daily_loaded = True
+                self.daily_dirty = True
+                if self.db_fault:
+                    self._daily_service('DB', self.db_fault)
+                    self.daily.mark_gap(self.now(), 'DB 연결 전 기록 일부 확인 불가')
+            legacy = await self.store.legacy_summary()
+            unseen = legacy['count'] - self.daily.legacy_seen_total
+            if unseen > 0:
+                stamp = self.now()
+                self._daily_roll(stamp)
+                self.daily.add_legacy(unseen, legacy['first_ms'], legacy['last_ms'], stamp)
+                self.daily.legacy_seen_total = legacy['count']
+                self.daily_dirty = True
             self.incidents = IncidentTracker(self.meta.get('incidents', {}), restart_ms=self.now())
             # Bridge already reported v3 incidents without replaying them in v4.
             if 'incidents' not in self.meta:
@@ -208,6 +231,10 @@ class Bot:
             self.history_checked.clear()
             self.pending_full = await self.store.count_pending() >= self.store.max_pending
             self.ready = True
+            self.services.pop('DB', None)
+            self._daily_service('DB', None)
+            self.db_fault = None
+            await self._persist_daily_locked(force=True)
             LOG.info('v4 DB restored: %d approved, %d histories, %d policy records',
                 len(approved), sum(bool(s.candles) for s in states.values()), len(watch))
 
@@ -220,6 +247,7 @@ class Bot:
                     self.pending_full = await self.store.count_pending() >= self.store.max_pending
             except Exception as exc:
                 self.ready = False
+                self.daily_db_failure(exc)
                 LOG.error('Database reconnect: %s', type(exc).__name__)
             await asyncio.sleep(5)
 
@@ -230,17 +258,24 @@ class Bot:
                 updated.pop(key, None)
             else:
                 updated[key] = detail
+            self._daily_service(key, detail, updated)
             tracker = IncidentTracker(self.incidents.snapshot())
             groups = {self.diagnostic_group('SERVICE:' + k, v): v for k, v in updated.items()}
             keys = {k for k in tracker.snapshot() if k.startswith('SERVICE:')} | set(groups)
             for group in keys:
                 tracker.observe(group, groups.get(group), self.now(), is_ws=group.startswith('SERVICE:WS:'))
+            # Persist the incident before the legacy status snapshot. A crash
+            # between those writes must not lose an already observed episode.
+            self.services = updated
+            await self._persist_daily_locked()
             if self.ready:
                 try:
                     await self.save(meta={'services': updated, 'incidents': tracker.snapshot()})
                 except Exception:
                     # Actual fault visibility is independent of durable notification state.
                     self.services = updated
+                    if self.db_fault:
+                        self.services['DB'] = self.db_fault
                     return
             self.services, self.incidents = updated, tracker
 
@@ -692,6 +727,120 @@ class Bot:
             found['LISTING_UNKNOWN'] = '재상장은 확인됐지만 실제 재상장시각이 미확인입니다. A/B를 보류합니다.'
         return found
 
+    def _daily_roll(self, now):
+        if not self.daily_loaded and not self.daily.groups and not self.daily.active:
+            self.daily = DailyLedger(now)
+        completed = self.daily.roll(now)
+        if completed:
+            self.daily_closed.extend(completed)
+            # During a prolonged database outage memory stays bounded. Missing
+            # days are reported as unknown; they are never fabricated as healthy.
+            if len(self.daily_closed) > 2:
+                self.daily_closed = self.daily_closed[-2:]
+                self.daily.mark_gap(now, 'DB 중단으로 과거 집계 일부 확인 불가')
+            self.daily_dirty = True
+
+    def _daily_service(self, key, detail, services=None):
+        now = self.now()
+        self._daily_roll(now)
+        services = self.services if services is None else services
+        source = 'KLINES' if key.startswith('KLINES:') else key
+        prefix = ('SERVICE:' + source + ':').upper()
+        if detail is not None:
+            kind = prefix + str(detail)[:120]
+            impact = (sum(k.startswith('KLINES:') and value == detail
+                          for k, value in services.items()) if source == 'KLINES' else None)
+            self.daily_dirty |= self.daily.observe(kind, impact, now)
+        elif not any(('KLINES' if k.startswith('KLINES:') else k) == source for k in services):
+            # Only actual successful work proves recovery, not a timer or a
+            # different error response from the same service.
+            for kind in tuple(self.daily.active):
+                if kind.startswith(prefix):
+                    self.daily_dirty |= self.daily.resolve(kind, now)
+
+    def daily_db_failure(self, exc):
+        self.db_fault = fault_code(exc)
+        self.services['DB'] = self.db_fault
+        self._daily_service('DB', self.db_fault)
+        self.daily.mark_gap(self.now(), 'DB 장애 중 미저장 기록 및 관측 공백 확인 불가')
+        self.daily_dirty = True
+
+    async def _persist_daily_locked(self, force=False):
+        if not self.ready or not self.daily_loaded:
+            return
+        now = self.now()
+        self._daily_roll(now)
+        if not (force or self.daily_dirty or self.daily_closed
+                or now - self.daily.last_checkpoint_ms >= 60_000):
+            return
+        previous = self.daily.last_checkpoint_ms
+        self.daily.checkpoint(now)
+        try:
+            await self.store.save_daily(self.daily.snapshot(), self.daily_closed)
+        except Exception as exc:
+            self.daily.last_checkpoint_ms = previous
+            self.ready = False
+            self.daily_db_failure(exc)
+            raise
+        self.daily_closed.clear()
+        self.daily_dirty = False
+
+    def daily_health(self, pending):
+        now = self.now()
+        active = [s for s in self.states.values() if s.trading and self.approved(s.symbol)]
+        return {
+            'ready': (sum(not self.status_problems(s) for s in active)
+                      if self.ready and not self.pending_full else 0),
+            'approved': len(active),
+            'history': sum(s.history_ready and minimum_close(s, now) is not None for s in active),
+            'pending': pending, 'unresolved': self.daily.active_count(),
+        }
+
+    async def _daily_reports_locked(self):
+        if not self.ready or not self.daily_loaded:
+            return
+        now = self.now()
+        self._daily_roll(now)
+        await self._persist_daily_locked()
+        day = self.daily.next_report_day
+        if day >= day_key(now):
+            return
+        payload = await self.store.daily_payload(day)
+        body = render_report(day, payload, now,
+                             self.daily_health(await self.store.count_pending()))
+        candidate = self.daily.snapshot()
+        candidate['next_report_day'] = next_day(day)
+        # Report registration and the next-day cursor share one transaction.
+        await self.store.enqueue_daily(day, body, now, candidate)
+        self.daily.next_report_day = candidate['next_report_day']
+        if 'DAILY_REPORT' in self.services:
+            self.services.pop('DAILY_REPORT')
+            self._daily_service('DAILY_REPORT', None)
+
+    async def daily_reports_once(self):
+        async with self.lock:
+            await self._daily_reports_locked()
+
+    async def daily_report_loop(self):
+        while True:
+            try:
+                await self.daily_reports_once()
+            except asyncio.CancelledError:
+                raise
+            except (ValueError, TypeError):
+                # A malformed report is visible, but must never suspend A/B
+                # evaluation or be mislabeled as a database outage.
+                self.services['DAILY_REPORT'] = 'DATA'
+                self._daily_service('DAILY_REPORT', 'DATA')
+                LOG.error('Daily report data invalid; market monitoring continues')
+            except Exception as exc:
+                self.ready = False
+                self.daily_db_failure(exc)
+                LOG.error('Daily report storage unavailable: %s', fault_code(exc))
+            # A dedicated one-second scheduler, independent of 15-second
+            # diagnostics and the unchanged market-data polling intervals.
+            await asyncio.sleep(1)
+
     @staticmethod
     def diagnostic_group(key, value):
         if key.startswith('SERVICE:'):
@@ -738,68 +887,86 @@ class Bot:
                     detail = current[members[0]]
                 tracker.observe(kind, detail, self.now(),
                     is_ws=kind.startswith('SERVICE:WS:') or kind in live_types)
-            new_types = sorted(tracker.due(self.now()),
-                key=lambda key: (not key.startswith('SERVICE:'), key))
-            events = []
-            if new_types:
-                lines = []
-                for kind in new_types:
-                    members = grouped.get(kind, [])
-                    line = f'{kind}: {len(members)}건'
-                    if len(members) <= 3 and not kind.startswith('SERVICE:'):
-                        line += ' (' + ', '.join(members) + ')'
-                    lines.append(line)
-                stamp = self.now()
-                detected = datetime.fromtimestamp(stamp / 1000, KST).strftime('%Y-%m-%d %H:%M:%S KST')
-                body = f'진단 요약 · {detected}\n' + '\n'.join(lines)
-                body += '\n종목별 상세: /status SYMBOL · 미확인 목록: /status 1 (다음 페이지는 숫자 증가)'
-                if len(body) > 3800:
-                    body = f'진단 요약 · {detected}\n새 장애 유형 {len(new_types)}개, 영향 상태 {sum(len(grouped.get(k, [])) for k in new_types)}건\n'
-                    body += '\n'.join(line[:150] for line in lines[:15])
-                    body += '\n모든 상세 유형과 종목은 /status 및 /status 1에서 확인하십시오.'
-                events = [Event('diag:' + str(uuid4()), '', 'DIAGNOSTIC', stamp, body)]
-                tracker.mark_notified(new_types, stamp)
-            await self.save(events=events, meta={'diagnostics': current, 'incidents': tracker.snapshot()})
+            now = self.now()
+            self._daily_roll(now)
+            symbol_types = {kind for kind in grouped if not kind.startswith('SERVICE:')}
+            for kind in symbol_types:
+                impact = None if kind == 'OUTBOX_FULL' else len(grouped[kind])
+                self.daily_dirty |= self.daily.observe(kind, impact, now)
+            for kind in tuple(self.daily.active):
+                if not kind.startswith('SERVICE:') and kind not in symbol_types:
+                    self.daily_dirty |= self.daily.resolve(kind, now)
+            # Services are captured when observed, including brief failures
+            # between diagnostic ticks. No DIAGNOSTIC event enters bot_pending.
+            await self._persist_daily_locked()
+            await self.save(events=[], meta={'diagnostics': current, 'incidents': tracker.snapshot()})
             self.incidents = tracker
+
+    async def sender_once(self):
+        if not self.ready:
+            return False
+        row = await self.store.first_pending(self.now())
+        daily = False
+        if row and row['id'].startswith('diag:'):
+            # Defensive guard for a legacy row restored after startup. Only
+            # diagnostic rows move; A/B and notice rows are never rewritten.
+            async with self.lock:
+                await self.store.migrate_daily_diagnostics(self.now())
+                legacy = await self.store.legacy_summary()
+                unseen = legacy['count'] - self.daily.legacy_seen_total
+                if unseen > 0:
+                    stamp = self.now()
+                    self._daily_roll(stamp)
+                    self.daily.add_legacy(unseen, legacy['first_ms'], legacy['last_ms'], stamp)
+                    self.daily.legacy_seen_total = legacy['count']
+                    self.daily_dirty = True
+                    await self._persist_daily_locked()
+            return True
+        if row is None:
+            row = await self.store.first_daily(self.now())
+            daily = True
+        if row is None:
+            return False
+        retry = self.store.retry_daily if daily else self.store.retry
+        attempt = row['attempts'] + 1
+        delay = min(3600, 5 * 2 ** min(attempt, 10))
+        await retry(row['id'], attempt, self.now() + delay * 1000)
+        try:
+            body = row['body'] if daily else delayed_message(row, self.now())
+            markup = row.get('reply_markup')
+            record = self.watch.get(row.get('symbol'))
+            if not daily and row['id'].startswith('notice:') and record and record['status'] not in ('PENDING', 'REVIEW'):
+                body = f'{row["symbol"]}\n감시 승인 처리 결과: {record["status"]}'
+                markup = {'inline_keyboard': []}
+            result = await self.telegram.send(body, reply_markup=markup)
+        except Exception as exc:
+            delay = max(delay, getattr(exc, 'delay', 0))
+            await retry(row['id'], attempt, self.now() + int(delay * 1000))
+            await self.service_problem('TELEGRAM', fault_code(exc))
+        else:
+            if daily:
+                await self.store.complete_daily(row['id'])
+            else:
+                message_id = result.get('message_id') if isinstance(result, dict) else None
+                await self.store.complete(row['id'], message_id=message_id)
+                if type(message_id) is int and row['id'].startswith('notice:'):
+                    async with self.lock:
+                        record = self.watch.get(row.get('symbol'))
+                        if record and record.get('notice_id') == row['id']:
+                            record['message_id'] = message_id
+            await self.service_problem('TELEGRAM')
+        return True
 
     async def sender_loop(self):
         while True:
-            if not self.ready:
-                await asyncio.sleep(2)
-                continue
             try:
-                row = await self.store.first_pending(self.now())
-                if not row:
-                    await asyncio.sleep(1)
-                    continue
-                attempt = row['attempts'] + 1
-                delay = min(3600, 5 * 2 ** min(attempt, 10))
-                await self.store.retry(row['id'], attempt, self.now() + delay * 1000)
-                try:
-                    body, markup = delayed_message(row, self.now()), row.get('reply_markup')
-                    record = self.watch.get(row.get('symbol'))
-                    if row['id'].startswith('notice:') and record and record['status'] not in ('PENDING', 'REVIEW'):
-                        body = f'{row["symbol"]}\n감시 승인 처리 결과: {record["status"]}'
-                        markup = {'inline_keyboard': []}
-                    result = await self.telegram.send(body, reply_markup=markup)
-                except Exception as exc:
-                    delay = max(delay, getattr(exc, 'delay', 0))
-                    await self.store.retry(row['id'], attempt, self.now() + int(delay * 1000))
-                    await self.service_problem('TELEGRAM', type(exc).__name__)
-                else:
-                    message_id = result.get('message_id') if isinstance(result, dict) else None
-                    await self.store.complete(row['id'], message_id=message_id)
-                    if type(message_id) is int and row['id'].startswith('notice:'):
-                        async with self.lock:
-                            record = self.watch.get(row.get('symbol'))
-                            if record and record.get('notice_id') == row['id']:
-                                record['message_id'] = message_id
-                    await self.service_problem('TELEGRAM')
-                await asyncio.sleep(1.1)
+                sent = await self.sender_once()
+                await asyncio.sleep(1.1 if sent else (1 if self.ready else 2))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.ready = False
+                self.daily_db_failure(exc)
                 LOG.error('Sender database failure: %s', type(exc).__name__)
                 await asyncio.sleep(5)
 
@@ -1159,7 +1326,7 @@ class Bot:
         tasks = [asyncio.create_task(self.db_loop()), asyncio.create_task(self.stream_loop('mark')),
                  asyncio.create_task(self.stream_loop('price')), asyncio.create_task(self.sender_loop()),
                  asyncio.create_task(self.commands_loop()), asyncio.create_task(self.candle_loop()),
-                 asyncio.create_task(self.recovery_loop())]
+                 asyncio.create_task(self.recovery_loop()), asyncio.create_task(self.daily_report_loop())]
         for key, work, seconds in [('CLOCK', self.sync_clock, 600), ('EXCHANGE', self.discover, REGULAR_REST_SECONDS),
               ('FUNDING_INFO', self.refresh_funding, REGULAR_REST_SECONDS),
               ('FUNDING_HISTORY', self.supplement, 60), ('LIVE_RECHECK', self.reconcile_live, REGULAR_REST_SECONDS),

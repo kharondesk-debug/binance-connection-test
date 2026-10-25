@@ -60,6 +60,18 @@ class MemoryStore:
                           'candles': copy.deepcopy(self.histories.get(symbol, []))}).candles
     async def count_pending(self):
         return len(self.pending)
+    async def load_daily(self):
+        return copy.deepcopy(self.meta.get('daily_report_state'))
+    async def save_daily(self, snapshot, completed=()):
+        if self.fail:
+            raise OSError('offline database failure')
+        self.meta['daily_report_state'] = copy.deepcopy(snapshot)
+    async def migrate_daily_diagnostics(self, now):
+        return {'count': 0, 'first_ms': None, 'last_ms': None}
+    async def legacy_summary(self):
+        return {'count': 0, 'first_ms': None, 'last_ms': None}
+    async def first_daily(self, now):
+        return None
     async def first_pending(self, now):
         rows = [r for r in self.pending.values() if r['due_ms'] <= now]
         return copy.deepcopy(min(rows, key=lambda r: (r['detected_ms'], r['id']))) if rows else None

@@ -276,8 +276,8 @@ class AppIncidentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.save.await_args.kwargs['events'], [])
         bot.clock_ms = 60_000
         await bot.diagnostics()
-        self.assertEqual(len(bot.save.await_args.kwargs['events']), 1)
-        self.assertIn('SERVICE:WS:mark:CLOSED', bot.save.await_args.kwargs['events'][0].message)
+        self.assertEqual(bot.save.await_args.kwargs['events'], [])
+        self.assertEqual(bot.daily.groups['SERVICE:WS:MARK:CLOSED']['events'], 1)
         bot.clock_ms = 61_000
         await bot.service_problem('WS:mark')
         bot.clock_ms = 62_000
@@ -291,7 +291,8 @@ class AppIncidentTests(unittest.IsolatedAsyncioTestCase):
         await bot.service_problem('WS:mark', 'CLOSED')
         bot.clock_ms += 60_000
         await bot.diagnostics()
-        self.assertEqual(len(bot.save.await_args.kwargs['events']), 1)
+        self.assertEqual(bot.save.await_args.kwargs['events'], [])
+        self.assertEqual(bot.daily.groups['SERVICE:WS:MARK:CLOSED']['events'], 3)
 
     async def test_application_independent_fault_causes_notify_independently(self):
         bot = self.bot()
@@ -303,9 +304,9 @@ class AppIncidentTests(unittest.IsolatedAsyncioTestCase):
         bot.clock_ms = 130_000
         await bot.diagnostics()
         events = bot.save.await_args.kwargs['events']
-        self.assertEqual(len(events), 1)
-        self.assertIn('HTTP_403', events[0].message)
-        self.assertNotIn('CLOSED', events[0].message)
+        self.assertEqual(events, [])
+        self.assertEqual(bot.daily.groups['SERVICE:WS:MARK:CLOSED']['events'], 1)
+        self.assertEqual(bot.daily.groups['SERVICE:WS:MARK:HTTP_403']['events'], 1)
 
     async def test_application_restart_keeps_notified_service_suppressed(self):
         bot = self.bot()
@@ -319,15 +320,15 @@ class AppIncidentTests(unittest.IsolatedAsyncioTestCase):
         await restored.diagnostics()
         self.assertEqual(restored.save.await_args.kwargs['events'], [])
 
-    async def test_application_diagnostic_flag_and_outbox_share_save(self):
+    async def test_application_diagnostic_state_saved_without_immediate_outbox(self):
         bot = self.bot()
         await bot.service_problem('WS:mark', 'DATA')
         bot.clock_ms = 60_000
         await bot.diagnostics()
         payload = bot.save.await_args.kwargs
-        self.assertEqual(len(payload['events']), 1)
-        self.assertEqual(payload['events'][0].kind, 'DIAGNOSTIC')
-        self.assertEqual(payload['meta']['incidents']['SERVICE:WS:mark:DATA']['notified_ms'], 60_000)
+        self.assertEqual(payload['events'], [])
+        self.assertIsNone(payload['meta']['incidents']['SERVICE:WS:mark:DATA']['notified_ms'])
+        self.assertEqual(bot.daily.groups['SERVICE:WS:MARK:DATA']['events'], 1)
 
     async def test_application_failed_diagnostic_save_does_not_mark_notified(self):
         bot = self.bot()
@@ -339,7 +340,8 @@ class AppIncidentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.incidents.records['SERVICE:WS:mark:CLOSED']['notified_ms'], None)
         bot.save.side_effect = None
         await bot.diagnostics()
-        self.assertEqual(len(bot.save.await_args.kwargs['events']), 1)
+        self.assertEqual(bot.save.await_args.kwargs['events'], [])
+        self.assertEqual(bot.daily.groups['SERVICE:WS:MARK:CLOSED']['events'], 1)
 
     async def test_application_db_failure_retains_actual_fault_visibility(self):
         bot = self.bot()
